@@ -335,7 +335,6 @@ public class ThreadLocal<T> {
          */
         static abstract class Factory {
 
-
             /**
              * Creates a new map for the given thread with the default array
              * length.
