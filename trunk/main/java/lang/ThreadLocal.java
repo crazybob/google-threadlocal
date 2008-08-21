@@ -52,7 +52,7 @@ public class ThreadLocal<T> {
     static final Object TOMBSTONE = new Object();
 
     /** Canonical phantom reference to this thread local instance. */
-    private final ThreadLocalReference<T> reference;
+    final ThreadLocalReference<T> reference;
 
     /** Factory used to access the ThreadLocalMap. */
     private final ThreadLocalMap.Factory mapFactory;
@@ -218,7 +218,7 @@ public class ThreadLocal<T> {
          * Internal hash. Hashes must be even. This ensures that the result of
          * (hash & (table.length - 1)) points to a key and not a value.
          */
-        private final int hash;
+        final int hash;
 
         /**
          * Used to access the referent while it's still alive.
@@ -267,21 +267,18 @@ public class ThreadLocal<T> {
     public T get() {
         // Optimized for the fast path...
         Thread currentThread = Thread.currentThread();
-        ThreadLocalMap map = mapFactory.getMap(currentThread);
+        ThreadLocalMap map = currentThread.threadLocals;
         if (map != null) {
             ThreadLocalReference<T> reference = this.reference;
             int index = reference.hash & map.mask;
-
-            /*
-             * We don't need volatile lookups here. The write happened in this
-             * thread.
-             */
             Object[] table = map.table;
-            if (reference == table[index]) {
-                return (T) table[index + 1];
+            if (reference == VolatileArray.get(table, index)) {
+                return (T) VolatileArray.get(table, index + 1);
             }
         } else {
-            map = mapFactory.newMap(currentThread, 32);
+            map = new ThreadLocalMap(MAP_FACTORY,
+                    ThreadLocalMap.INITIAL_LENGTH);
+            currentThread.threadLocals = map;
         }
 
         return (T) map.getAfterMiss(this);
@@ -330,17 +327,21 @@ public class ThreadLocal<T> {
      */
     static class ThreadLocalMap {
 
+        /** Capacity = 16 */
+        static final int INITIAL_LENGTH = 32;
+
         /**
          * Looks up and creates ThreadLocalMaps.
          */
         static abstract class Factory {
+
 
             /**
              * Creates a new map for the given thread with the default array
              * length.
              */
             ThreadLocalMap newMap(Thread current) {
-                return newMap(current, 32); // capacity = 16
+                return newMap(current, INITIAL_LENGTH);
             }
 
             /**
@@ -356,7 +357,7 @@ public class ThreadLocal<T> {
         }
 
         /** Used to turn hashes into indices. */
-        private final int mask;
+        final int mask;
 
         /** Total number of live and dead entries. */
         private int load;
@@ -453,7 +454,11 @@ public class ThreadLocal<T> {
 
             // Move over entries.
             for (int i = table.length - 2; i >= 0; i -= 2) {
-                Object k = VolatileArray.get(table, i);
+                /*
+                 * Volatile read not necessary. We don't care if we see
+                 * tombstones written by the background thread.
+                 */
+                Object k = table[i];
                 if (k == null || k == TOMBSTONE) {
                     // Skip this entry.
                     continue;
@@ -469,7 +474,14 @@ public class ThreadLocal<T> {
                 ThreadLocal<?> threadLocal = reference.get();
                 if (threadLocal != null) {
                     // Entry is still alive. Move it over.
-                    // assert threadLocal won't get reclaimed during put()
+                    /*
+                     * TODO: We need to ensure that threadLocal doesn't get
+                     * garbage collected during put(). If it were to get
+                     * reclaimed after the null check, the cleanup thread could
+                     * try to remove the entry before we actually insert it,
+                     * and we'd end up leaking the value (until the next
+                     * rehash).  
+                     */
                     newMap.put(reference, VolatileArray.get(table, i + 1));
                 }
             }
@@ -498,15 +510,15 @@ public class ThreadLocal<T> {
                 if (k == null) {
                     if (firstTombstone == -1) {
                         // Fill in null slot.
+                        table[index + 1] = value;
                         VolatileArray.set(table, index, reference);
-                        VolatileArray.set(table, index + 1, value);
                         load++;
                         return;
                     }
 
                     // Go back and replace first tombstone.
+                    table[firstTombstone + 1] = value;
                     VolatileArray.set(table, firstTombstone, reference);
-                    VolatileArray.set(table, firstTombstone + 1, value);
                     tombstones.decrementAndGet();
                     return;
                 }
@@ -535,8 +547,8 @@ public class ThreadLocal<T> {
 
                 // If the map is still the same and the slot is still empty...
                 if (this == latest && VolatileArray.get(table, index) == null) {
+                    table[index + 1] = value;
                     VolatileArray.set(table, index, reference);
-                    VolatileArray.set(table, index + 1, value);
                     load++;
 
                     // The table could now exceed its maximum load.
@@ -572,10 +584,11 @@ public class ThreadLocal<T> {
                     if (this == latest) {
                         // If we passed a tombstone and that slot still
                         // contains a tombstone...
-                        if (firstTombstone > -1
-                                && VolatileArray.get(table, firstTombstone) == TOMBSTONE) {
-                            VolatileArray.set(table, firstTombstone, key.reference);
-                            VolatileArray.set(table, firstTombstone + 1, value);
+                        if (firstTombstone > -1 && VolatileArray.get(
+                                table, firstTombstone) == TOMBSTONE) {
+                            table[firstTombstone + 1] = value;
+                            VolatileArray.set(table, firstTombstone,
+                                    key.reference);
                             tombstones.decrementAndGet();
                             load++;
 
@@ -586,8 +599,8 @@ public class ThreadLocal<T> {
 
                         // If this slot is still empty...
                         if (VolatileArray.get(table, index) == null) {
+                            table[index + 1] = value;
                             VolatileArray.set(table, index, key.reference);
-                            VolatileArray.set(table, index + 1, value);
                             load++;
 
                             // The table could now exceed its maximum load.
