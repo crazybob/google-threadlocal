@@ -16,9 +16,9 @@
 
 package java.lang;
 
-import java.lang.ref.WeakReference;
-import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
+import java.lang.ref.PhantomReference;
+import java.lang.ref.WeakReference;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.List;
@@ -33,28 +33,50 @@ import java.util.ArrayList;
  */
 public class ThreadLocal<T> {
 
-    /** Hash counter. */
-    private static AtomicInteger hashCounter = new AtomicInteger(0);
+    /**
+     * Factory for normal (non-inheritable) thread locals.
+     */
+    private static final ThreadLocalMap.Factory MAP_FACTORY
+            = new ThreadLocalMap.Factory() {
+        ThreadLocalMap newMap(Thread current, int length) {
+            return current.threadLocals = new ThreadLocalMap(this, length);
+        }
+
+        ThreadLocalMap getMap(Thread current) {
+            return current.threadLocals;
+        }
+    };
+
+    /** Placeholder for deleted keys of deleted entries. */
+    static final Object TOMBSTONE = new Object();
+
+    /** Canonical phantom reference to this thread local instance. */
+    private final ThreadLocalReference<T> reference;
+
+    /** Factory used to access the ThreadLocalMap. */
+    private final ThreadLocalMap.Factory mapFactory;
 
     /**
-     * Internal hash. We deliberately don't bother with #hashCode().
-     * Hashes must be even. This ensures that the result of
-     * (hash & (table.length - 1)) points to a key and not a value.
+     * Creates a new thread local variable using the given factory.
      */
-    private final int hash;
+    ThreadLocal(ThreadLocalMap.Factory mapFactory) {
+        this.mapFactory = mapFactory;
+        this.reference = newReference();
+    }
 
-    /** Weak reference to this thread local instance. */
-    private final ThreadLocalReference reference;
     /**
      * Creates a new thread local variable.
      */
     public ThreadLocal() {
-        /*
-         * We increment by Doug Lea's Magic Number(TM) (*2 since keys are in
-         * every other bucket) to help prevent clustering.
-         */
-        this.hash = hashCounter.getAndAdd(0x61c88647 << 1);
-        this.reference = new ThreadLocalReference<T>(this, this.hash);
+        this(MAP_FACTORY);
+    }
+
+    /**
+     * Creates a ThreadLocalReference for this ThreadLocal. Overridden by
+     * {@link InheritableThreadLocal}.
+     */
+    ThreadLocalReference<T> newReference() {
+        return new ThreadLocalReference<T>(this);
     }
 
     /**
@@ -73,56 +95,84 @@ public class ThreadLocal<T> {
             cleanerThread.start();
         }
 
+        @SuppressWarnings("InfiniteLoopStatement")
         public void run() {
             List<ThreadLocalReference> references
                     = new ArrayList<ThreadLocalReference>();
+            List<ThreadLocalReference> inheritableReferences
+                    = new ArrayList<ThreadLocalReference>();
             while (true) {
                 references.clear();
+                inheritableReferences.clear();
 
                 try {
-                    references.add(queue.remove());
+                    ThreadLocalReference<?> reference = queue.remove();
+                    reference.clear();
+                    if (reference.isInheritable()) {
+                        inheritableReferences.add(reference);
+                    } else {
+                        references.add(reference);
+                    }
                 } catch (InterruptedException e) {
                     continue;
                 }
 
                 ThreadLocalReference next;
                 while ((next = queue.poll()) != null) {
-                    references.add(next);
+                    next.clear();
+                    if (next.isInheritable()) {
+                        inheritableReferences.add(next);
+                    } else {
+                        references.add(next);
+                    }
                 }
 
-                cleanUp(references);
+                cleanUp(references, inheritableReferences);
             }
         }
 
+        /** Reusable thread array. */
         private static Thread[] threads = new Thread[Thread.activeCount() * 2];
 
-        private static void cleanUp(List<ThreadLocalReference> references) {
+        private static void cleanUp(List<ThreadLocalReference> references,
+                List<ThreadLocalReference> inheritableReferences) {
+            /*
+             * TODO: Do we need to worry about inactive threads? We may want
+             * to keep track of threads ourselves. We'd keep a weak set and
+             * add a thread when we create the first map for it.
+             */
+
             // Expand the array until it's big enough to hold every thread.
-            while (Thread.enumerate(threads) == threads.length) {
+            int threadCount;
+            while ((threadCount = Thread.enumerate(threads))
+                    == threads.length) {
                 threads = new Thread[threads.length * 2];
             }
 
-            for (int i = 0; i < threads.length; i++) {
+            for (int i = 0; i < threadCount; i++) {
                 Thread thread = threads[i];
                 threads[i] = null;
 
-                // TODO: accessing non-volatile field from two threads!!!!
-                ThreadLocalMap threadLocals = thread.threadLocals;
-                if (threadLocals != null) {
-                    Table table = threadLocals.table;
-                    removeAll(table, references);
+                ThreadLocalMap map = thread.threadLocals;
+                if (map != null) {
+                    removeAll(map, references);
+                }
+
+                ThreadLocalMap inheritableMap = thread.inheritableThreadLocals;
+                if (inheritableMap != null) {
+                    removeAll(inheritableMap, inheritableReferences);
                 }
             }
         }
 
-        private static void removeAll(Table table,
+        private static void removeAll(ThreadLocalMap map,
                 List<ThreadLocalReference> references) {
             /*
              * We know this list supports random access. Avoid iterator
              * allocation.
              */
             for (int i = references.size() - 1; i >= 0; i--) {
-                ThreadLocalMap.remove(table, references.get(i));
+                map.remove(references.get(i));
             }
         }
     }
@@ -149,29 +199,60 @@ public class ThreadLocal<T> {
     }
 
     /**
-     * A weak reference to a thread local. Contains the same hash as the
-     * thread local so we can clean up entries after the ThreadLocal is
-     * reclaimed by the garbage collector.
+     * A canonical reference to a ThreadLocal instance. We use this reference
+     * as the key in the ThreadLocalMap instead of the ThreadLocal directly
+     * so as not to prevent garbage collection of the ThreadLocal.
      *
-     * <p>We really want to use PhantomReference here. Right now, if a
-     * finalize() method resurects a ThreadLocal, the reference will still be
-     * dead and we will not clean up after the entries any longer. To implement
-     * this, we need to be able to access the referent for PhantomReference so
-     * that we can make InheritableThreadLocal work.
+     * <p>We use a PhantomReference instead of a WeakReference because we want
+     * to ensure that the ThreadLocal can't be resurrected after we clean up
+     * its entries.
      */
-    private static class ThreadLocalReference<T>
-            extends WeakReference<ThreadLocal<T>> {
+    static class ThreadLocalReference<T>
+            extends PhantomReference<ThreadLocal<T>> {
 
+        /** Hash counter. */
+        private static AtomicInteger hashCounter = new AtomicInteger(0);
+
+        /**
+         * Internal hash. Hashes must be even. This ensures that the result of
+         * (hash & (table.length - 1)) points to a key and not a value.
+         */
         private final int hash;
 
-        private ThreadLocalReference(ThreadLocal<T> referent, int hash) {
+        /**
+         * Used to access the referent while it's still alive.
+         */
+        private final WeakReference<ThreadLocal<T>> weakReference;
+
+        ThreadLocalReference(ThreadLocal<T> referent) {
             /*
-             * Accessing referenceQueue here triggers Cleaner's static
-             * initializer and starts the cleanup thread if it hasn't
-             * started already.
+             * Accessing Cleaner.queue here triggers Cleaner's static
+             * initializer and starts the cleanup thread.
              */
             super(referent, Cleaner.queue.delegate);
-            this.hash = hash;
+
+            /*
+             * We increment by Doug Lea's Magic Number(TM) (*2 since keys are in
+             * every other bucket) to help prevent clustering.
+             */
+            this.hash = hashCounter.getAndAdd(0x61c88647 << 1);
+
+            weakReference = new WeakReference<ThreadLocal<T>>(referent);
+        }
+
+        /**
+         * Gets the referent if it's still strongly or softly reachable.
+         */
+        @Override
+        public ThreadLocal<T> get() {
+            return weakReference.get();
+        }
+
+        /**
+         * Returns true if this references an inheritable thread local.
+         */
+        boolean isInheritable() {
+            return false;
         }
     }
 
@@ -183,20 +264,25 @@ public class ThreadLocal<T> {
      */
     @SuppressWarnings("unchecked")
     public T get() {
-        // Optimized for the fast path.
+        // Optimized for the fast path...
         Thread currentThread = Thread.currentThread();
-        ThreadLocalMap values = values(currentThread);
-        if (values != null) {
-            Table table = values.table;
-            int index = hash & table.mask;
-            if (this.reference == table.get(index)) {
-                return (T) table.get(index + 1);
+        ThreadLocalMap map = mapFactory.getMap(currentThread);
+        if (map != null) {
+            ThreadLocalReference<T> reference = this.reference;
+            int index = reference.hash & map.mask;
+
+            /*
+             * TODO: We don't need volatile lookups here. The write
+             * happened in this thread.
+             */
+            if (reference == map.get(index)) {
+                return (T) map.get(index + 1);
             }
         } else {
-            values = initializeValues(currentThread);
+            map = mapFactory.newMap(currentThread, 32);
         }
 
-        return (T) values.getAfterMiss(this);
+        return (T) map.getAfterMiss(this);
     }
 
     /**
@@ -214,11 +300,13 @@ public class ThreadLocal<T> {
      */
     public void set(T value) {
         Thread currentThread = Thread.currentThread();
-        ThreadLocalMap values = values(currentThread);
-        if (values == null) {
-            values = initializeValues(currentThread);
+        ThreadLocalMap map = mapFactory.getMap(currentThread);
+        if (map == null) {
+            map = mapFactory.newMap(currentThread);
+            map.put(reference, value);
+        } else {
+            map.maybeRehash().put(reference, value);
         }
-        values.put(this, value);
     }
 
     /**
@@ -229,35 +317,42 @@ public class ThreadLocal<T> {
      */
     public void remove() {
         Thread currentThread = Thread.currentThread();
-        ThreadLocalMap values = values(currentThread);
-        if (values != null) {
-            values.remove(this);
+        ThreadLocalMap map = mapFactory.getMap(currentThread);
+        if (map != null) {
+            map.remove(reference);
         }
     }
 
     /**
-     * Creates Values instance for this thread and variable type.
+     * Per-thread map of ThreadLocal instances to values. Implemented as an
+     * array of alternating keys (of type ThreadLocalReference) and values.
      */
-    ThreadLocalMap initializeValues(Thread current) {
-        return current.threadLocals = new ThreadLocalMap();
-    }
+    static class ThreadLocalMap extends AtomicReferenceArray<Object> {
 
-    /**
-     * Gets Values instance for this thread and variable type.
-     */
-    ThreadLocalMap values(Thread current) {
-        return current.threadLocals;
-    }
+        /**
+         * Looks up and creates ThreadLocalMaps.
+         */
+        static abstract class Factory {
 
-    /** Placeholder for deleted keys of deleted entries. */
-    private static final Object TOMBSTONE = new Object();
+            /**
+             * Creates a new map for the given thread with the default array
+             * length.
+             */
+            ThreadLocalMap newMap(Thread current) {
+                return newMap(current, 32); // capacity = 16
+            }
 
-    /**
-     * Entry table. Array of alternating keys and values.
-     *
-     * TODO: Combine Table and ThreadLocalMap into one class.
-     */
-    private static class Table extends AtomicReferenceArray<Object> {
+            /**
+             * Creates a new map for the given thread with the given array
+             * length.
+             */
+            abstract ThreadLocalMap newMap(Thread current, int length);
+
+            /**
+             * Gets the map for the given thread.
+             */
+            abstract ThreadLocalMap getMap(Thread current);
+        }
 
         /** Used to turn hashes into indices. */
         private final int mask;
@@ -265,37 +360,40 @@ public class ThreadLocal<T> {
         /** Total number of live and dead entries. */
         private int load;
 
-        /** Maximum number of entries before we must build a new table. */
+        /** Maximum number of entries before we must rebuild the map. */
         private final int maximumLoad;
 
         /**
-         * Number of tombstones in this table. This value is not exact.
+         * Number of tombstones in this map. This value is not exact.
          * We decide whether or not to rehash based upon the load (which
          * is exact). This rough tombstone count just enables us to estimate
          * the number of live entries so we can decide whether or not to expand
-         * the table.
+         * the entry array.
          */
         private final AtomicInteger tombstones;
 
         /**
-         * Creates a new Table with the given capacity.
+         * Factory to use for creating new ThreadLocalMaps when rehashing.
          */
-        private static Table withCapacity(int capacity) {
-            int length = capacity << 1;
-            return new Table(length);
-        }
+        private final Factory factory;
 
-        /** Constructs an empty table with the given length. */
-        private Table(int length) {
+        /**
+         * Constructs an empty map with the given array length.
+         *
+         * @param length of the underlying array, must be power of 2,
+         *  2X capacity
+         */
+        ThreadLocalMap(Factory factory, int length) {
             super(length);
+            this.factory = factory;
             this.mask = length - 1;
             this.load = 0;
-            this.maximumLoad = length / 3; // 2/3
+            this.maximumLoad = length / 3; // 2/3 capacity
             this.tombstones = new AtomicInteger(0);
         }
 
         /**
-         * Gets the next index. If we're at the end of the table, we wrap
+         * Gets the next index. If we're at the end of the array, we wrap
          * back around to 0.
          */
         private int next(int index) {
@@ -303,57 +401,26 @@ public class ThreadLocal<T> {
         }
 
         /**
-         * Returns maximum number of entries this table can hold.
+         * Returns maximum number of entries map can hold.
          */
         private int capacity() {
             return length() >> 1;
         }
-    }
-
-    /**
-     * Per-thread map of ThreadLocal instances to values.
-     */
-    static class ThreadLocalMap {
-
-        /** Size, must always be a power of 2. */
-        private static final int INITIAL_SIZE = 16;
-
+        
         /**
-         * Pointer to most current table.
-         */
-        private volatile Table table;
-
-        /**
-         * Constructs a new, empty instance.
-         */
-        ThreadLocalMap() {
-            this.table = Table.withCapacity(INITIAL_SIZE);
-        }
-
-        /**
-         * Constructs a new map with the given table.
-         */
-        private ThreadLocalMap(Table table) {
-            this.table = table;
-        }
-
-        /**
-         * Rehashes the table, expanding or contracting it as necessary.
-         * Gets rid of tombstones. Returns true if a rehash occurred.
-         * We must rehash every time we fill a null slot; we depend on the
-         * presence of null slots to end searches (otherwise, we'll infinitely
-         * loop).
+         * Rehashes the map if necessary. Expands the underlying array if
+         * necessary. Gets rid of tombstones. We must rehash every time we fill
+         * a null slot; we depend on the presence of null slots to end searches
+         * (otherwise, we'll infinitely loop).
          *
-         * @return latest Table
+         * @return latest map
          */
-        private Table rehash() {
-            Table oldTable = this.table;
-
-            if (oldTable.load < oldTable.maximumLoad) {
-                return oldTable;
+        private ThreadLocalMap maybeRehash() {
+            if (load < maximumLoad) {
+                return this;
             }
 
-            int oldCapacity = oldTable.capacity();
+            int oldCapacity = capacity();
 
             // Default to the same capacity. This will create a table of the
             // same size and move over the live entries, analogous to a
@@ -363,79 +430,78 @@ public class ThreadLocal<T> {
             // and not fill up the table).
             int newCapacity = oldCapacity;
 
-            int liveEntries = oldTable.load - oldTable.tombstones.get();
+            int liveEntries = load - tombstones.get();
             if (liveEntries > (oldCapacity >> 1)) {
                 // More than 1/2 filled w/ live entries.
                 // Double size.
                 newCapacity = oldCapacity << 1;
             }
 
-            // Allocate new table.
-            Table newTable = new Table(newCapacity);
-            this.table = newTable;
+            // Create new map.
+            ThreadLocalMap newMap = factory.newMap(Thread.currentThread(),
+                    newCapacity << 1);
 
             // Move over entries.
-            for (int i = oldTable.length() - 2; i >= 0; i -= 2) {
-                Object k = oldTable.get(i);
+            for (int i = length() - 2; i >= 0; i -= 2) {
+                Object k = get(i);
                 if (k == null || k == TOMBSTONE) {
                     // Skip this entry.
                     continue;
                 }
 
-                // The table can only contain null, tombstones and references.
+                /*
+                 * The table can only contain null, tombstones and references,
+                 * so this must be a reference.
+                 */
                 @SuppressWarnings("unchecked")
-                Reference<ThreadLocal<?>> reference
-                        = (Reference<ThreadLocal<?>>) k;
-                ThreadLocal<?> key = reference.get();
-                if (key != null) {
-                    // Entry is still live. Move it over.
-                    put(newTable, key, oldTable.get(i + 1));
+                ThreadLocalReference<?> reference
+                        = (ThreadLocalReference<?>) k;
+                ThreadLocal<?> threadLocal = reference.get();
+                if (threadLocal != null) {
+                    // Entry is still alive. Move it over.
+                    /*
+                     * TODO: make sure threadLocal won't be GC'ed during put().
+                     * We don't want the cleanup thread cleaning an entry we're
+                     * in the process of putting.
+                     */
+                    newMap.put(reference, get(i + 1));
                 }
             }
 
-            return newTable;
-        }
-
-        /**
-         * Sets entry for given ThreadLocal to given value, creating an
-         * entry if necessary.
-         */
-        private void put(ThreadLocal<?> key, Object value) {
-            put(rehash(), key, value);
+            return newMap;
         }
 
         /**
          * Sets entry for ThreadLocal to value in the given table, creating an
-         * entry if necessary.
+         * entry if necessary. Assumes this map has adequate capacity.
          */
-        private static void put(Table table, ThreadLocal<?> key, Object value) {
+        void put(ThreadLocalReference<?> reference, Object value) {
             // Keep track of first tombstone. That's where we want to go back
             // and add an entry if necessary.
             int firstTombstone = -1;
 
-            for (int index = key.hash & table.mask;;
-                    index = table.next(index)) {
-                Object k = table.get(index);
+            for (int index = reference.hash & mask;; index = next(index)) {
+                Object k = get(index);
 
-                if (k == key.reference) {
+                if (k == reference) {
                     // Replace existing entry.
-                    table.set(index + 1, value);
+                    set(index + 1, value);
                     return;
                 }
 
                 if (k == null) {
                     if (firstTombstone == -1) {
                         // Fill in null slot.
-                        table.set(index, key.reference);
-                        table.set(index + 1, value);
-                        table.load++;
+                        set(index, reference);
+                        set(index + 1, value);
+                        load++;
                         return;
                     }
 
                     // Go back and replace first tombstone.
-                    table.set(firstTombstone, key.reference);
-                    table.set(firstTombstone + 1, value);
-                    table.tombstones.decrementAndGet();
+                    set(firstTombstone, reference);
+                    set(firstTombstone + 1, value);
+                    tombstones.decrementAndGet();
                     return;
                 }
 
@@ -451,26 +517,29 @@ public class ThreadLocal<T> {
          * slot.
          */
         Object getAfterMiss(ThreadLocal<?> key) {
-            Table table = this.table;
-            int index = key.hash & table.mask;
+            ThreadLocalReference<?> reference = key.reference;
+            int index = reference.hash & mask;
 
             // If the first slot is empty, the search is over.
-            if (table.get(index) == null) {
+            if (get(index) == null) {
                 Object value = key.initialValue();
 
-                // If the table is still the same and the slot is still empty...
-                if (this.table == table && table.get(index) == null) {
-                    table.set(index, key.reference);
-                    table.set(index + 1, value);
-                    table.load++;
+                // Get the latest map.
+                ThreadLocalMap latest = factory.getMap(Thread.currentThread());
+
+                // If the map is still the same and the slot is still empty...
+                if (this == latest && get(index) == null) {
+                    set(index, reference);
+                    set(index + 1, value);
+                    load++;
 
                     // The table could now exceed its maximum load.
-                    rehash();
+                    maybeRehash();
                     return value;
                 }
 
                 // The table changed during initialValue().
-                put(key, value);
+                latest.maybeRehash().put(reference, value);
                 return value;
             }
 
@@ -479,26 +548,30 @@ public class ThreadLocal<T> {
             int firstTombstone = -1;
 
             // Continue search.
-            for (index = table.next(index);; index = table.next(index)) {
-                Object reference = table.get(index);
-                if (reference == key.reference) {
-                    return table.get(index + 1);
+            for (index = next(index);; index = next(index)) {
+                Object k = get(index);
+                if (k == key.reference) {
+                    return get(index + 1);
                 }
 
                 // If no entry was found...
-                if (reference == null) {
+                if (k == null) {
                     Object value = key.initialValue();
 
-                    // If the table is still the same...
-                    if (this.table == table) {
+                    // Get the latest map.
+                    ThreadLocalMap latest
+                            = factory.getMap(Thread.currentThread());
+
+                    // If the map is still the same...
+                    if (this == latest) {
                         // If we passed a tombstone and that slot still
                         // contains a tombstone...
                         if (firstTombstone > -1
-                                && table.get(firstTombstone) == TOMBSTONE) {
-                            table.set(firstTombstone, key.reference);
-                            table.set(firstTombstone + 1, value);
-                            table.tombstones.decrementAndGet();
-                            table.load++;
+                                && get(firstTombstone) == TOMBSTONE) {
+                            set(firstTombstone, key.reference);
+                            set(firstTombstone + 1, value);
+                            tombstones.decrementAndGet();
+                            load++;
 
                             // No need to clean up here. We aren't filling
                             // in a null slot.
@@ -506,23 +579,23 @@ public class ThreadLocal<T> {
                         }
 
                         // If this slot is still empty...
-                        if (table.get(index) == null) {
-                            table.set(index, key.reference);
-                            table.set(index + 1, value);
-                            table.load++;
+                        if (get(index) == null) {
+                            set(index, key.reference);
+                            set(index + 1, value);
+                            load++;
 
                             // The table could now exceed its maximum load.
-                            rehash();
+                            maybeRehash();
                             return value;
                         }
                     }
 
                     // The table changed during initialValue().
-                    put(key, value);
+                    latest.maybeRehash().put(reference, value);
                     return value;
                 }
 
-                if (firstTombstone == -1 && reference == TOMBSTONE) {
+                if (firstTombstone == -1 && k == TOMBSTONE) {
                     // Keep track of this tombstone so we can overwrite it.
                     firstTombstone = index;
                 }
@@ -532,18 +605,12 @@ public class ThreadLocal<T> {
         /**
          * Removes entry for the given ThreadLocal.
          */
-        void remove(ThreadLocal<?> key) {
-            remove(this.table, key.reference);
-        }
+        void remove(ThreadLocalReference<?> key) {
+            for (int index = key.hash & mask;;
+                    index = next(index)) {
+                Object reference = get(index);
 
-        /**
-         * Removes entry for the given ThreadLocal from the given Table.
-         */
-        private static void remove(Table table, ThreadLocalReference<?> k) {
-            for (int index = k.hash & table.mask;; index = table.next(index)) {
-                Object reference = table.get(index);
-
-                if (reference == k) {
+                if (reference == key) {
                     /*
                      * Success! We deliberately clear out the value before the
                      * key. If we replaced the key with a tombstone before
@@ -552,9 +619,9 @@ public class ThreadLocal<T> {
                      * we null out the value. If this happened, the background
                      * thread could accidentally null out the new value.
                      */
-                    table.set(index + 1, null);
-                    table.set(index, TOMBSTONE);
-                    table.tombstones.incrementAndGet();
+                    set(index + 1, null);
+                    set(index, TOMBSTONE);
+                    tombstones.incrementAndGet();
                     return;
                 }
 
@@ -569,47 +636,15 @@ public class ThreadLocal<T> {
     /**
      * Inherits thread locals from parent thread.
      */
-    static ThreadLocalMap createInheritedMap(ThreadLocalMap inherited) {
-        Table parentTable = inherited.table;
-        Table childTable = Table.withCapacity(parentTable.capacity());
-        inheritValues(parentTable, childTable);
-        return new ThreadLocalMap(childTable);
-    }
-
-    /**
-     * Inherits values from a parent thread. Called in parent thread.
-     */
-    @SuppressWarnings({"unchecked"})
-    private static void inheritValues(Table parentTable, Table childTable) {
-        // Transfer values from parent to child thread.
-        for (int i = parentTable.length() - 2; i >= 0; i -= 2) {
-            Object k = parentTable.get(i);
-
-            if (k == null) {
-                // Skip this entry.
-                continue;
-            }
-
-            // The table can only contain null, tombstones and references.
-            Reference<InheritableThreadLocal<?>> reference
-                    = (Reference<InheritableThreadLocal<?>>) k;
-            // Raw type enables us to pass in an Object below.
-            InheritableThreadLocal key = reference.get();
-            if (key != null) {
-                // Replace value with filtered value.
-                // We should just let exceptions bubble out and tank
-                // the thread creation
-                childTable.set(i + 1,
-                        key.childValue(parentTable.get(i + 1)));
-            } else {
-                // The key was reclaimed.
-                childTable.set(i, TOMBSTONE);
-                parentTable.set(i, TOMBSTONE);
-                parentTable.set(i + 1, null);
-
-                childTable.tombstones.incrementAndGet();
-                parentTable.tombstones.incrementAndGet();
-            }
-        }
+    static ThreadLocalMap createInheritedMap(ThreadLocalMap parentMap) {
+        /*
+         * TODO: The background thread can't get to this map yet, but it
+         * needs immediate access (or else we may leak entries for thread
+         * locals that get reclaimed after we've already transferred them).
+         */
+        ThreadLocalMap childMap = new ThreadLocalMap(parentMap.factory,
+                parentMap.length());
+        InheritableThreadLocal.inheritValues(parentMap, childMap);
+        return childMap;
     }
 }
