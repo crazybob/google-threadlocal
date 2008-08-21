@@ -79,13 +79,16 @@ public class InheritableThreadLocal<T> extends ThreadLocal<T> {
     }
 
     /**
-     * Transfers inheritable values from parent to child thread.
+     * Transfers inheritable values from parent to child thread. Executes in
+     * parent thread.
      */
     @SuppressWarnings({"unchecked"})
     static void inheritValues(ThreadLocalMap parentMap,
             ThreadLocalMap childMap) {
-        for (int i = parentMap.length() - 2; i >= 0; i -= 2) {
-            Object k = parentMap.get(i);
+        Object[] parentTable = parentMap.table;
+        for (int i = parentTable.length - 2; i >= 0; i -= 2) {
+            // No need for a volatile read. The write happened in this thread.
+            Object k = parentTable[i];
 
             if (k == null || k == TOMBSTONE) {
                 // Skip this entry.
@@ -104,8 +107,7 @@ public class InheritableThreadLocal<T> extends ThreadLocal<T> {
                  * We should just let exceptions bubble out and tank the
                  * thread creation
                  */
-                childMap.put(reference,
-                        key.childValue(parentMap.get(i + 1)));
+                childMap.put(reference, key.childValue(parentTable[i + 1]));
             }
         }
     }
