@@ -16,7 +16,6 @@
 
 package java.lang;
 
-
 /**
  * A variable for which each thread has its own value; child threads will
  * inherit the value at thread creation time.
@@ -27,10 +26,48 @@ package java.lang;
  */
 public class InheritableThreadLocal<T> extends ThreadLocal<T> {
 
+    private static final ThreadLocalMap.Factory MAP_FACTORY
+            = new ThreadLocalMap.Factory() {
+        ThreadLocalMap newMap(Thread current, int length) {
+            return current.inheritableThreadLocals
+                    = new ThreadLocalMap(this, length);
+        }
+
+        ThreadLocalMap getMap(Thread current) {
+            return current.inheritableThreadLocals;
+        }
+    };
+
     /**
      * Creates a new inheritable thread local variable.
      */
-    public InheritableThreadLocal() {}
+    public InheritableThreadLocal() {
+        super(MAP_FACTORY);
+    }
+
+    @Override
+    ThreadLocalReference<T> newReference() {
+        return new InheritableThreadLocalReference<T>(this);
+    }
+
+    /**
+     * A specialized implementation that enables us to access the referent
+     * so long as it's still alive. Unlike a vanilla phantom reference, this
+     * implementation enables us to retrieve the referent so we can filter
+     * thread local values when we inherit them.
+     */
+    private static class InheritableThreadLocalReference<T>
+            extends ThreadLocalReference<T> {
+
+        private InheritableThreadLocalReference(ThreadLocal<T> referent) {
+            super(referent);
+        }
+
+        @Override
+        boolean isInheritable() {
+            return true;
+        }
+    }
 
     /**
      * Creates a value for the child thread given the parent thread's value.
@@ -41,14 +78,35 @@ public class InheritableThreadLocal<T> extends ThreadLocal<T> {
         return parentValue;
     }
 
-    @Override
-    ThreadLocalMap values(Thread current) {
-        return current.inheritableThreadLocals;
-    }
+    /**
+     * Transfers inheritable values from parent to child thread.
+     */
+    @SuppressWarnings({"unchecked"})
+    static void inheritValues(ThreadLocalMap parentMap,
+            ThreadLocalMap childMap) {
+        for (int i = parentMap.length() - 2; i >= 0; i -= 2) {
+            Object k = parentMap.get(i);
 
-    @Override
-    ThreadLocalMap initializeValues(Thread current) {
-        return current.inheritableThreadLocals
-                = new ThreadLocal.ThreadLocalMap();
+            if (k == null || k == TOMBSTONE) {
+                // Skip this entry.
+                continue;
+            }
+
+            // The table can only contain null, tombstones and references.
+            ThreadLocalReference reference = (ThreadLocalReference) k;
+            // Raw type enables us to pass in an Object below.
+            InheritableThreadLocal key
+                    = (InheritableThreadLocal) reference.get();
+            if (key != null) {
+                /*
+                 * Replace value with filtered value. We shouldn't need to
+                 * rehash since we adopted the same length as our parent.
+                 * We should just let exceptions bubble out and tank the
+                 * thread creation
+                 */
+                childMap.put(reference,
+                        key.childValue(parentMap.get(i + 1)));
+            }
+        }
     }
 }
