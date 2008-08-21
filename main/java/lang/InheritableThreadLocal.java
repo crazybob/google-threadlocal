@@ -69,6 +69,28 @@ public class InheritableThreadLocal<T> extends ThreadLocal<T> {
         }
     }
 
+    @Override
+    @SuppressWarnings("unchecked")
+    public T get() {
+        // Optimized for the fast path...
+        Thread currentThread = Thread.currentThread();
+        ThreadLocalMap map = currentThread.inheritableThreadLocals;
+        if (map != null) {
+            ThreadLocalReference<T> reference = this.reference;
+            int index = reference.hash & map.mask;
+            Object[] table = map.table;
+            if (reference == VolatileArray.get(table, index)) {
+                return (T) VolatileArray.get(table, index + 1);
+            }
+        } else {
+            map = new ThreadLocalMap(MAP_FACTORY,
+                    ThreadLocalMap.INITIAL_LENGTH);
+            currentThread.threadLocals = map;
+        }
+
+        return (T) map.getAfterMiss(this);
+    }
+
     /**
      * Creates a value for the child thread given the parent thread's value.
      * Called from the parent thread when creating a child thread. The default
