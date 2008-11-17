@@ -81,125 +81,6 @@ public class ThreadLocal<T> {
     }
 
     /**
-     * Cleans up after garbage collected thread locals. A more efficient
-     * alternative implementation would clean up directly during garbage
-     * collection instead of using a separate thread.
-     */
-    private static class Cleaner implements Runnable {
-
-        private static final ThreadLocalReferenceQueue queue
-                = new ThreadLocalReferenceQueue();
-
-        static {
-            Thread cleanerThread = new Thread(new Cleaner());
-            cleanerThread.setDaemon(true);
-            cleanerThread.start();
-        }
-
-        @SuppressWarnings("InfiniteLoopStatement")
-        public void run() {
-            List<ThreadLocalReference> references
-                    = new ArrayList<ThreadLocalReference>();
-            List<ThreadLocalReference> inheritableReferences
-                    = new ArrayList<ThreadLocalReference>();
-            while (true) {
-                references.clear();
-                inheritableReferences.clear();
-
-                try {
-                    ThreadLocalReference<?> reference = queue.remove();
-                    reference.clear();
-                    if (reference.isInheritable()) {
-                        inheritableReferences.add(reference);
-                    } else {
-                        references.add(reference);
-                    }
-                } catch (InterruptedException e) {
-                    continue;
-                }
-
-                ThreadLocalReference next;
-                while ((next = queue.poll()) != null) {
-                    next.clear();
-                    if (next.isInheritable()) {
-                        inheritableReferences.add(next);
-                    } else {
-                        references.add(next);
-                    }
-                }
-
-                cleanUp(references, inheritableReferences);
-            }
-        }
-
-        /** Reusable thread array. */
-        private static Thread[] threads = new Thread[Thread.activeCount() * 2];
-
-        private static void cleanUp(List<ThreadLocalReference> references,
-                List<ThreadLocalReference> inheritableReferences) {
-            /*
-             * TODO: Do we need to worry about inactive threads? We may want
-             * to keep track of threads ourselves. We'd keep a weak set and
-             * add a thread when we create the first map for it.
-             */
-
-            // Expand the array until it's big enough to hold every thread.
-            int threadCount;
-            while ((threadCount = Thread.enumerate(threads))
-                    == threads.length) {
-                threads = new Thread[threads.length * 2];
-            }
-
-            for (int i = 0; i < threadCount; i++) {
-                Thread thread = threads[i];
-                threads[i] = null;
-
-                ThreadLocalMap map = thread.threadLocals;
-                if (map != null) {
-                    removeAll(map, references);
-                }
-
-                ThreadLocalMap inheritableMap = thread.inheritableThreadLocals;
-                if (inheritableMap != null) {
-                    removeAll(inheritableMap, inheritableReferences);
-                }
-            }
-        }
-
-        private static void removeAll(ThreadLocalMap map,
-                List<ThreadLocalReference> references) {
-            /*
-             * We know this list supports random access. Avoid iterator
-             * allocation.
-             */
-            for (int i = references.size() - 1; i >= 0; i--) {
-                map.remove(references.get(i));
-            }
-        }
-    }
-
-
-    /**
-     * Queue of reference to thread locals which have been reclaimed by
-     * the garbage collector.
-     */
-    private static class ThreadLocalReferenceQueue {
-
-        private final ReferenceQueue<ThreadLocal<?>> delegate
-                = new ReferenceQueue<ThreadLocal<?>>();
-
-        /** @see java.lang.ref.ReferenceQueue#remove() */
-        private ThreadLocalReference<?> remove() throws InterruptedException {
-            return (ThreadLocalReference<?>) delegate.remove();
-        }
-
-        /** @see java.lang.ref.ReferenceQueue#poll() */
-        private ThreadLocalReference<?> poll() {
-            return (ThreadLocalReference<?>) delegate.poll();
-        }
-    }
-
-    /**
      * A canonical reference to a ThreadLocal instance. We use this reference
      * as the key in the ThreadLocalMap instead of the ThreadLocal directly
      * so as not to prevent garbage collection of the ThreadLocal.
@@ -318,7 +199,15 @@ public class ThreadLocal<T> {
         Thread currentThread = Thread.currentThread();
         ThreadLocalMap map = mapFactory.getMap(currentThread);
         if (map != null) {
+            /*
+             * Ensure that this ThreadLocal doesn't get garbage collected
+             * during removal. If the ThreadLocal were to be reclaimed,
+             * the background thread could accidentally overwrite a subsequent
+             * value stored in the same slot.
+             */
+            map.pin = this;
             map.remove(reference);
+            map.pin = null;
         }
     }
 
@@ -380,6 +269,11 @@ public class ThreadLocal<T> {
 
         /** Entry table. Alternating keys and values. */
         final Object[] table;
+
+        /**
+         * Used to prevent garbage collection of a ThreadLocal instance.
+         */
+        private volatile ThreadLocal<?> pin;
 
         /**
          * Constructs an empty map with the given array length.
@@ -472,16 +366,19 @@ public class ThreadLocal<T> {
                         = (ThreadLocalReference<?>) k;
                 ThreadLocal<?> threadLocal = reference.get();
                 if (threadLocal != null) {
-                    // Entry is still alive. Move it over.
                     /*
-                     * TODO: We need to ensure that threadLocal doesn't get
-                     * garbage collected during put(). If it were to get
-                     * reclaimed after the null check, the cleanup thread could
-                     * try to remove the entry before we actually insert it,
-                     * and we'd end up leaking the value (until the next
+                     * Entry is still alive. Move it over.
+                     * 
+                     * Ensure that threadLocal doesn't get garbage collected
+                     * during put(). If it were to get reclaimed after the
+                     * null check, the cleanup thread could try to remove the
+                     * entry before we actually insert it, and we'd end up
+                     * leaking the value (until the next
                      * rehash).  
                      */
+                    pin = threadLocal;
                     newMap.put(reference, VolatileArray.get(table, i + 1));
+                    pin = null;
                 }
             }
 
@@ -509,14 +406,14 @@ public class ThreadLocal<T> {
                 if (k == null) {
                     if (firstTombstone == -1) {
                         // Fill in null slot.
-                        table[index + 1] = value;
+                        VolatileArray.set(table, index + 1, value);
                         VolatileArray.set(table, index, reference);
                         load++;
                         return;
                     }
 
                     // Go back and replace first tombstone.
-                    table[firstTombstone + 1] = value;
+                    VolatileArray.set(table, index + 1, value);
                     VolatileArray.set(table, firstTombstone, reference);
                     tombstones.decrementAndGet();
                     return;
@@ -546,7 +443,7 @@ public class ThreadLocal<T> {
 
                 // If the map is still the same and the slot is still empty...
                 if (this == latest && VolatileArray.get(table, index) == null) {
-                    table[index + 1] = value;
+                    VolatileArray.set(table, index + 1, value);
                     VolatileArray.set(table, index, reference);
                     load++;
 
@@ -585,7 +482,7 @@ public class ThreadLocal<T> {
                         // contains a tombstone...
                         if (firstTombstone > -1 && VolatileArray.get(
                                 table, firstTombstone) == TOMBSTONE) {
-                            table[firstTombstone + 1] = value;
+                            VolatileArray.set(table, index + 1, value);
                             VolatileArray.set(table, firstTombstone,
                                     key.reference);
                             tombstones.decrementAndGet();
@@ -598,7 +495,7 @@ public class ThreadLocal<T> {
 
                         // If this slot is still empty...
                         if (VolatileArray.get(table, index) == null) {
-                            table[index + 1] = value;
+                            VolatileArray.set(table, index + 1, value);
                             VolatileArray.set(table, index, key.reference);
                             load++;
 
@@ -695,5 +592,127 @@ public class ThreadLocal<T> {
                 parentMap.table.length);
         InheritableThreadLocal.inheritValues(parentMap, childMap);
         return childMap;
+    }
+
+    /**
+     * <b>Note:</b> This code should be rewritten more cleanly and efficiently
+     * using VM-specific APIs.
+     *
+     * <p>Cleans up after garbage collected thread locals. A more efficient
+     * alternative implementation would clean up directly during garbage
+     * collection instead of using a separate thread.
+     */
+    private static class Cleaner implements Runnable {
+
+        private static final ThreadLocalReferenceQueue queue
+                = new ThreadLocalReferenceQueue();
+
+        static {
+            Thread cleanerThread = new Thread(new Cleaner());
+            cleanerThread.setDaemon(true);
+            cleanerThread.start();
+        }
+
+        @SuppressWarnings("InfiniteLoopStatement")
+        public void run() {
+            List<ThreadLocalReference> references
+                    = new ArrayList<ThreadLocalReference>();
+            List<ThreadLocalReference> inheritableReferences
+                    = new ArrayList<ThreadLocalReference>();
+            while (true) {
+                references.clear();
+                inheritableReferences.clear();
+
+                try {
+                    ThreadLocalReference<?> reference = queue.remove();
+                    reference.clear();
+                    if (reference.isInheritable()) {
+                        inheritableReferences.add(reference);
+                    } else {
+                        references.add(reference);
+                    }
+                } catch (InterruptedException e) {
+                    continue;
+                }
+
+                ThreadLocalReference next;
+                while ((next = queue.poll()) != null) {
+                    next.clear();
+                    if (next.isInheritable()) {
+                        inheritableReferences.add(next);
+                    } else {
+                        references.add(next);
+                    }
+                }
+
+                cleanUp(references, inheritableReferences);
+            }
+        }
+
+        /** Reusable thread array. */
+        private static Thread[] threads = new Thread[Thread.activeCount() * 2];
+
+        private static void cleanUp(List<ThreadLocalReference> references,
+                List<ThreadLocalReference> inheritableReferences) {
+            /*
+             * TODO: Do we need to worry about inactive threads? We may want
+             * to keep track of threads ourselves. We'd keep a weak set and
+             * add a thread when we create the first map for it.
+             */
+
+            // Expand the array until it's big enough to hold every thread.
+            int threadCount;
+            while ((threadCount = Thread.enumerate(threads))
+                    == threads.length) {
+                threads = new Thread[threads.length * 2];
+            }
+
+            for (int i = 0; i < threadCount; i++) {
+                Thread thread = threads[i];
+                threads[i] = null;
+
+                ThreadLocalMap map = thread.threadLocals;
+                if (map != null) {
+                    removeAll(map, references);
+                }
+
+                ThreadLocalMap inheritableMap = thread.inheritableThreadLocals;
+                if (inheritableMap != null) {
+                    removeAll(inheritableMap, inheritableReferences);
+                }
+            }
+        }
+
+        private static void removeAll(ThreadLocalMap map,
+                List<ThreadLocalReference> references) {
+            /*
+             * We know this list supports random access. Avoid iterator
+             * allocation.
+             */
+            for (int i = references.size() - 1; i >= 0; i--) {
+                map.remove(references.get(i));
+            }
+        }
+    }
+
+
+    /**
+     * Queue of reference to thread locals which have been reclaimed by
+     * the garbage collector.
+     */
+    private static class ThreadLocalReferenceQueue {
+
+        private final ReferenceQueue<ThreadLocal<?>> delegate
+                = new ReferenceQueue<ThreadLocal<?>>();
+
+        /** @see java.lang.ref.ReferenceQueue#remove() */
+        private ThreadLocalReference<?> remove() throws InterruptedException {
+            return (ThreadLocalReference<?>) delegate.remove();
+        }
+
+        /** @see java.lang.ref.ReferenceQueue#poll() */
+        private ThreadLocalReference<?> poll() {
+            return (ThreadLocalReference<?>) delegate.poll();
+        }
     }
 }
