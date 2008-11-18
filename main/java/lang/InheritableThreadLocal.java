@@ -85,7 +85,7 @@ public class InheritableThreadLocal<T> extends ThreadLocal<T> {
         } else {
             map = new ThreadLocalMap(MAP_FACTORY,
                     ThreadLocalMap.INITIAL_LENGTH);
-            currentThread.threadLocals = map;
+            currentThread.inheritableThreadLocals = map;
         }
 
         return (T) map.getAfterMiss(this);

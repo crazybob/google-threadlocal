@@ -273,6 +273,7 @@ public class ThreadLocal<T> {
         /**
          * Used to prevent garbage collection of a ThreadLocal instance.
          */
+        @SuppressWarnings("UnusedDeclaration")
         private volatile ThreadLocal<?> pin;
 
         /**
@@ -283,11 +284,6 @@ public class ThreadLocal<T> {
          */
         ThreadLocalMap(Factory factory, int length) {
             this.table = new Object[length];
-
-            // TODO: Do we really need this if the array reference is final?
-            // The JMM requires us to perform at least one volatile write.
-            // assert length > 0
-            VolatileArray.set(this.table, 0, null);
 
             this.factory = factory;
             this.mask = length - 1;
@@ -347,11 +343,7 @@ public class ThreadLocal<T> {
 
             // Move over entries.
             for (int i = table.length - 2; i >= 0; i -= 2) {
-                /*
-                 * Volatile read not necessary. We don't care if we see
-                 * tombstones written by the background thread.
-                 */
-                Object k = table[i];
+                Object k = VolatileArray.get(table, i);
                 if (k == null || k == TOMBSTONE) {
                     // Skip this entry.
                     continue;
@@ -394,6 +386,7 @@ public class ThreadLocal<T> {
             // and add an entry if necessary.
             int firstTombstone = -1;
 
+            Object[] table = this.table;
             for (int index = reference.hash & mask;; index = next(index)) {
                 Object k = VolatileArray.get(table, index);
 
@@ -413,7 +406,7 @@ public class ThreadLocal<T> {
                     }
 
                     // Go back and replace first tombstone.
-                    VolatileArray.set(table, index + 1, value);
+                    VolatileArray.set(table, firstTombstone + 1, value);
                     VolatileArray.set(table, firstTombstone, reference);
                     tombstones.decrementAndGet();
                     return;
@@ -431,10 +424,13 @@ public class ThreadLocal<T> {
          * slot.
          */
         Object getAfterMiss(ThreadLocal<?> key) {
+            // TODO: Pin ThreadLocal during get()?
+
             ThreadLocalReference<?> reference = key.reference;
             int index = reference.hash & mask;
 
             // If the first slot is empty, the search is over.
+            Object[] table = this.table;
             if (VolatileArray.get(table, index) == null) {
                 Object value = key.initialValue();
 
@@ -464,7 +460,7 @@ public class ThreadLocal<T> {
             // Continue search.
             for (index = next(index);; index = next(index)) {
                 Object k = VolatileArray.get(table, index);
-                if (k == key.reference) {
+                if (k == reference) {
                     return VolatileArray.get(table, index + 1);
                 }
 
@@ -482,11 +478,10 @@ public class ThreadLocal<T> {
                         // contains a tombstone...
                         if (firstTombstone > -1 && VolatileArray.get(
                                 table, firstTombstone) == TOMBSTONE) {
-                            VolatileArray.set(table, index + 1, value);
+                            VolatileArray.set(table, firstTombstone + 1, value);
                             VolatileArray.set(table, firstTombstone,
                                     key.reference);
                             tombstones.decrementAndGet();
-                            load++;
 
                             // No need to clean up here. We aren't filling
                             // in a null slot.
@@ -496,7 +491,7 @@ public class ThreadLocal<T> {
                         // If this slot is still empty...
                         if (VolatileArray.get(table, index) == null) {
                             VolatileArray.set(table, index + 1, value);
-                            VolatileArray.set(table, index, key.reference);
+                            VolatileArray.set(table, index, reference);
                             load++;
 
                             // The table could now exceed its maximum load.
@@ -608,17 +603,18 @@ public class ThreadLocal<T> {
                 = new ThreadLocalReferenceQueue();
 
         static {
-            Thread cleanerThread = new Thread(new Cleaner());
+            Thread cleanerThread = new Thread(new Cleaner(),
+                    "ThreadLocal.Cleaner");
             cleanerThread.setDaemon(true);
             cleanerThread.start();
         }
 
         @SuppressWarnings("InfiniteLoopStatement")
         public void run() {
-            List<ThreadLocalReference> references
-                    = new ArrayList<ThreadLocalReference>();
-            List<ThreadLocalReference> inheritableReferences
-                    = new ArrayList<ThreadLocalReference>();
+            List<ThreadLocalReference<?>> references
+                    = new ArrayList<ThreadLocalReference<?>>();
+            List<ThreadLocalReference<?>> inheritableReferences
+                    = new ArrayList<ThreadLocalReference<?>>();
             while (true) {
                 references.clear();
                 inheritableReferences.clear();
@@ -652,8 +648,8 @@ public class ThreadLocal<T> {
         /** Reusable thread array. */
         private static Thread[] threads = new Thread[Thread.activeCount() * 2];
 
-        private static void cleanUp(List<ThreadLocalReference> references,
-                List<ThreadLocalReference> inheritableReferences) {
+        private static void cleanUp(List<ThreadLocalReference<?>> references,
+                List<ThreadLocalReference<?>> inheritableReferences) {
             /*
              * TODO: Do we need to worry about inactive threads? We may want
              * to keep track of threads ourselves. We'd keep a weak set and
@@ -684,17 +680,17 @@ public class ThreadLocal<T> {
         }
 
         private static void removeAll(ThreadLocalMap map,
-                List<ThreadLocalReference> references) {
+                List<ThreadLocalReference<?>> references) {
             /*
              * We know this list supports random access. Avoid iterator
              * allocation.
              */
             for (int i = references.size() - 1; i >= 0; i--) {
-                map.remove(references.get(i));
+                ThreadLocalReference<?> key = references.get(i);
+                map.remove(key);
             }
         }
     }
-
 
     /**
      * Queue of reference to thread locals which have been reclaimed by
