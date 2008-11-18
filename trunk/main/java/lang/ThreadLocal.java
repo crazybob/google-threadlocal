@@ -591,7 +591,9 @@ public class ThreadLocal<T> {
 
     /**
      * <b>Note:</b> This code should be rewritten more cleanly and efficiently
-     * using VM-specific APIs.
+     * using VM-specific APIs. Ideally, the garbage collector would just do
+     * this clean up directly. Then, we wouldn't have to incur the overhead of
+     * an additional thread, the reference queue, etc.
      *
      * <p>Cleans up after garbage collected thread locals. A more efficient
      * alternative implementation would clean up directly during garbage
