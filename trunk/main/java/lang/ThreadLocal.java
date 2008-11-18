@@ -399,15 +399,13 @@ public class ThreadLocal<T> {
                 if (k == null) {
                     if (firstTombstone == -1) {
                         // Fill in null slot.
-                        VolatileArray.set(table, index + 1, value);
-                        VolatileArray.set(table, index, reference);
+                        VolatileArray.set2(table, index, reference, value);
                         load++;
                         return;
                     }
 
                     // Go back and replace first tombstone.
-                    VolatileArray.set(table, firstTombstone + 1, value);
-                    VolatileArray.set(table, firstTombstone, reference);
+                    VolatileArray.set2(table, firstTombstone, reference, value);
                     tombstones.decrementAndGet();
                     return;
                 }
@@ -424,7 +422,7 @@ public class ThreadLocal<T> {
          * slot.
          */
         Object getAfterMiss(ThreadLocal<?> key) {
-            // TODO: Pin ThreadLocal during get()?
+            // TODO: Do we need to pin the ThreadLocal here?
 
             ThreadLocalReference<?> reference = key.reference;
             int index = reference.hash & mask;
@@ -439,8 +437,7 @@ public class ThreadLocal<T> {
 
                 // If the map is still the same and the slot is still empty...
                 if (this == latest && VolatileArray.get(table, index) == null) {
-                    VolatileArray.set(table, index + 1, value);
-                    VolatileArray.set(table, index, reference);
+                    VolatileArray.set2(table, index, reference, value);
                     load++;
 
                     // The table could now exceed its maximum load.
@@ -478,9 +475,8 @@ public class ThreadLocal<T> {
                         // contains a tombstone...
                         if (firstTombstone > -1 && VolatileArray.get(
                                 table, firstTombstone) == TOMBSTONE) {
-                            VolatileArray.set(table, firstTombstone + 1, value);
-                            VolatileArray.set(table, firstTombstone,
-                                    key.reference);
+                            VolatileArray.set2(table, firstTombstone,
+                                    reference, value);
                             tombstones.decrementAndGet();
 
                             // No need to clean up here. We aren't filling
@@ -490,8 +486,7 @@ public class ThreadLocal<T> {
 
                         // If this slot is still empty...
                         if (VolatileArray.get(table, index) == null) {
-                            VolatileArray.set(table, index + 1, value);
-                            VolatileArray.set(table, index, reference);
+                            VolatileArray.set2(table, index, reference, value);
                             load++;
 
                             // The table could now exceed its maximum load.
@@ -529,8 +524,7 @@ public class ThreadLocal<T> {
                      * we null out the value. If this happened, the background
                      * thread could accidentally null out the new value.
                      */
-                    VolatileArray.set(table, index + 1, null);
-                    VolatileArray.set(table, index, TOMBSTONE);
+                    VolatileArray.set2(table, index, TOMBSTONE, null);
                     tombstones.incrementAndGet();
                     return;
                 }
@@ -561,7 +555,7 @@ public class ThreadLocal<T> {
          * Performs a volatile read from the given array.
          */
         static Object get(Object[] array, int index) {
-            // assert i >= 0 && i < table.length
+            // assert index >= 0 && index < table.length
             return unsafe.getObjectVolatile(array, base + index * elementSize);
         }
 
@@ -569,8 +563,18 @@ public class ThreadLocal<T> {
          * Performs a volatile write to an array.
          */
         static void set(Object[] array, int index, Object value) {
-            // assert i >= 0 && i < table.length
+            // assert index >= 0 && index < table.length
             unsafe.putObjectVolatile(array, base + index * elementSize, value);
+        }
+
+        /**
+         * Stores b volatilly at array[index + 1] and then a at array[index].
+         */
+        static void set2(Object[] array, int index, Object a, Object b) {
+            // assert index >= 0 && index < table.length - 1
+            int aIndex = base + index * elementSize;
+            unsafe.putObjectVolatile(array, aIndex + elementSize, b);
+            unsafe.putObjectVolatile(array, aIndex, a);
         }
     }
 
