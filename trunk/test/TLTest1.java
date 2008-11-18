@@ -141,7 +141,7 @@ class TLTest1 implements Runnable {
                         for (int i = 0; i < NTHREADS; ++i) {
                             threads[i].join();
                         }
-                    }
+                    }   
                     catch (InterruptedException ie) {
                         System.out.println("Interrupted");
                         return;
