@@ -1,0 +1,1 @@
+This implementation aims to improve upon correctness, performance, memory usage, and freedom compared to existing implementations. It is currently used by Apache Harmony and Dalvik (Android).
